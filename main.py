@@ -8,26 +8,18 @@ import random
 import string
 import re
 import logging
-import httpx  # 使用 httpx 替代 requests 以实现真正的异步
-from typing import List, Dict, Generator, Optional, AsyncGenerator
+import httpx
+from typing import List, Dict, Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-
-# --- 配置日志 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
-# --- Pydantic 模型 ---
 class ChatMessage(BaseModel):
     role: str
     content: str
-
 
 class ChatCompletionRequest(BaseModel):
     model: str = "gemini-2.5-flash"
@@ -37,13 +29,11 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     session_id: Optional[str] = ""
 
-
 class ChatCompletionChoice(BaseModel):
     index: int
     message: Optional[Dict] = None
     delta: Optional[Dict] = None
     finish_reason: str
-
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -53,14 +43,11 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionChoice]
     usage: Optional[Dict] = None
 
-
-# --- 核心：Toolbaz API 适配器 ---
 class ToolbazToOpenAI:
     def __init__(self):
         self.base_url = "https://data.toolbaz.com"
-        # 使用 httpx.AsyncClient 替代 requests.Session 以实现真正的异步
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(120.0, connect=10.0),  # 增加了超时时间
+            timeout=httpx.Timeout(120.0, connect=10.0),
             headers={
                 "Accept": "*/*",
                 "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -122,8 +109,7 @@ class ToolbazToOpenAI:
                 self.last_token = device_token
                 return result["token"]
             return None
-        except Exception as e:
-            logger.error(f"获取 capcha token 失败: {e}")
+        except Exception:
             return None
 
     def messages_to_toolbaz_format(self, messages: List[ChatMessage]) -> str:
@@ -151,7 +137,6 @@ class ToolbazToOpenAI:
             "model": request.model,
             "session_id": request.session_id,
         }
-        # 尝试传递更多参数，即使后端可能不使用
         if request.temperature is not None:
             data["temperature"] = request.temperature
         if request.max_tokens is not None:
@@ -161,8 +146,7 @@ class ToolbazToOpenAI:
             response = await self._client.post(url, data=data)
             response.raise_for_status()
             
-            # --- 核心修复：过滤掉后端返回的 [model: ...] 标签 ---
-            cleaned_content = re.sub(r'^\[model: .+?\]\s*', '', response.text, flags=re.MULTILINE)
+            cleaned_content = re.sub(r'\s*\[model: .+?\]\s*', '', response.text, flags=re.DOTALL).strip()
             
             completion_id = f"chatcmpl-{self.generate_random_string(29)}"
             created = int(time.time())
@@ -179,20 +163,14 @@ class ToolbazToOpenAI:
                 model=request.model,
                 choices=[choice]
             )
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Toolbaz API 请求失败: {e.response.status_code} - {e.response.text}")
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
         except Exception as e:
-            logger.error(f"chat_completion 发生未知错误: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     async def chat_completion_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         formatted_message = self.messages_to_toolbaz_format(request.messages)
         capcha_token = await self.get_capcha_token(request.session_id, len(request.messages) > 1)
         if not capcha_token:
-            # 在流中处理错误，通过 SSE 发送错误信息
-            error_data = {"error": {"message": "Failed to get capcha token", "type": "internal_error"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
+            yield f"data: {json.dumps({'error': {'message': 'Failed to get capcha token', 'type': 'internal_error'}})}\n\n"
             return
 
         url = f"{self.base_url}/writing.php"
@@ -215,74 +193,62 @@ class ToolbazToOpenAI:
             async with self._client.stream("POST", url, data=data) as resp:
                 resp.raise_for_status()
                 
-                # 发送初始的 "role" delta
                 start_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk", "created": created,
                     "model": request.model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
                 }
                 yield f"data: {json.dumps(start_chunk)}\n\n"
                 
-                # --- 核心修复：流式过滤逻辑 ---
-                header_stripped = False
-                initial_buffer = ""
+                buffer = ""
+                BUFFER_SIZE = 100
                 
-                # 使用 aiter_text 并增大 chunk_size，提高效率
-                async for chunk in resp.aiter_text(chunk_size=128):
-                    if not header_stripped:
-                        initial_buffer += chunk
-                        # 检查缓冲区中是否包含完整的模型标签
-                        if re.search(r'^\[model: .+?\]', initial_buffer, flags=re.MULTILINE):
-                            # 移除标签和可能的空白
-                            cleaned_chunk = re.sub(r'^\[model: .+?\]\s*', '', initial_buffer, flags=re.MULTILINE)
-                            if cleaned_chunk:
-                                delta_chunk = {
-                                    "id": completion_id, "object": "chat.completion.chunk", "created": created,
-                                    "model": request.model, "choices": [{"index": 0, "delta": {"content": cleaned_chunk}, "finish_reason": None}]
-                                }
-                                yield f"data: {json.dumps(delta_chunk)}\n\n"
-                            header_stripped = True
-                    else:
-                        # 头部已处理，直接流式传输后续内容
-                        delta_chunk = {
+                async for chunk in resp.aiter_text():
+                    buffer += chunk
+                    if len(buffer) > BUFFER_SIZE:
+                        to_send = buffer[:-BUFFER_SIZE]
+                        buffer = buffer[-BUFFER_SIZE:]
+                        
+                        delta = {
                             "id": completion_id, "object": "chat.completion.chunk", "created": created,
-                            "model": request.model, "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
+                            "model": request.model, "choices": [{"index": 0, "delta": {"content": to_send}, "finish_reason": None}]
                         }
-                        yield f"data: {json.dumps(delta_chunk)}\n\n"
+                        yield f"data: {json.dumps(delta)}\n\n"
                 
-                # 发送结束标记
+                if buffer:
+                    cleaned_tail = re.sub(r'\s*\[model: .+?\]\s*', '', buffer, flags=re.DOTALL)
+                    if cleaned_tail:
+                        delta = {
+                            "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                            "model": request.model, "choices": [{"index": 0, "delta": {"content": cleaned_tail}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(delta)}\n\n"
+                
                 end_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk", "created": created,
                     "model": request.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 }
                 yield f"data: {json.dumps(end_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+                
         except Exception as e:
-            logger.error(f"chat_completion_stream 发生错误: {e}")
             error_data = {"error": {"message": str(e), "type": "internal_error"}}
             yield f"data: {json.dumps(error_data)}\n\n"
 
     async def close(self):
-        """关闭异步客户端，释放资源。"""
         await self._client.aclose()
 
-
-# --- FastAPI 应用实例 ---
-app = FastAPI(title="Toolbaz to OpenAI API (Optimized)", version="2.0.0")
+app = FastAPI(title="Toolbaz to OpenAI API", version="2.0.0")
 toolbaz_client = ToolbazToOpenAI()
-
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    logger.info(f"收到请求: model={request.model}, stream={request.stream}, messages={len(request.messages)}")
     if request.stream:
-        # --- 核心修复：使用正确的 media_type ---
         return StreamingResponse(
             toolbaz_client.chat_completion_stream(request),
             media_type="text/event-stream"
         )
     else:
         return await toolbaz_client.chat_completion(request)
-
 
 @app.get("/v1/models")
 async def list_models():
@@ -297,20 +263,13 @@ async def list_models():
         ]
     }
 
-
 @app.get("/health")
 async def health():
-    """健康检查端点。"""
     return {"status": "ok"}
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """应用关闭时，清理资源。"""
-    logger.info("正在关闭应用，清理资源...")
     await toolbaz_client.close()
-    logger.info("资源已清理。")
-
 
 if __name__ == "__main__":
     import uvicorn
